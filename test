@@ -1,1686 +1,683 @@
+теперь убери из этого кода функционал по изменению и удалению записей. 
 
+<?php
+/* 
+Template Name: Admin Bookings Page 
+Template Post Type: page
+*/
 
+function custom_password_form() {
+    global $post;
+    return '
+    <div style="max-width:400px; margin:100px auto; padding:20px; text-align:center;">
+        <h3>Доступ только для администраторов</h3>
+        <form action="' . esc_url(site_url('wp-login.php?action=postpass', 'login_post')) . '" method="post">
+            <input type="password" name="post_password" placeholder="Пароль" style="padding:8px; margin:10px; width:200px;">
+            <button type="submit" style="padding:8px 20px; background:#007cba; color:white; border:none; border-radius:4px;">Войти</button>
+        </form>
+    </div>';
+}
+add_filter('the_password_form', 'custom_password_form');
 
-
-
-/* Основные обработчики бронирований */
-if (!defined('ABSPATH')) exit; // Защита от прямого доступа
-
-// Константы должны быть в начале файла
-define('TELEGRAM_BOT_TOKEN', '7623757721:AAElzsJ9ajJq_d1ATbI5VFBoiAF0aKyJpcE');
-define('ADMIN_CHAT_ID', '930819186');
-
-/* Основные обработчики бронирований */
-add_action('wp_ajax_get_time_slots', 'get_time_slots');
-add_action('wp_ajax_nopriv_get_time_slots', 'get_time_slots');
-add_action('wp_ajax_submit_booking', 'submit_booking');
-add_action('wp_ajax_nopriv_submit_booking', 'submit_booking');
-
-
-
-// =============================================
-// БАЗОВЫЕ ФУНКЦИИ БРОНИРОВАНИЯ
-// =============================================
-
-function get_time_slots() {
-    global $wpdb;
-    
-    $service_id = intval($_POST['service_id']);
-    $date = sanitize_text_field($_POST['date']);
-    
-    // Проверка даты
-    $selected_date = strtotime($date);
-    $today = strtotime(date('Y-m-d 00:00:00'));
-    
-    if ($selected_date < $today) {
-        wp_send_json_error('Нельзя выбрать прошедшую дату');
-    }
-    
-    // Получаем данные услуги
-    $service = $wpdb->get_row($wpdb->prepare(
-        "SELECT duration, break, weekday_price, weekend_price 
-         FROM {$wpdb->prefix}booking_services 
-         WHERE id = %d", 
-        $service_id
-    ));
-    
-    if(!$service) {
-        wp_send_json_error('Услуга не найдена');
-    }
-    
-    $day_of_week = date('w', strtotime($date));
-    $is_weekend = ($day_of_week == 0 || $day_of_week == 6);
-    $price = $is_weekend ? $service->weekend_price : $service->weekday_price;
-    
-    // Получаем существующие брони с их перерывами
-    $bookings = $wpdb->get_results($wpdb->prepare(
-        "SELECT o.start_time, o.end_time, s.break 
-         FROM {$wpdb->prefix}booking_orders o
-         LEFT JOIN {$wpdb->prefix}booking_services s ON o.service_id = s.id
-         WHERE o.booking_date = %s", 
-        $date
-    ));
-    
-    $slots = [];
-    $start_time = strtotime("10:00");
-    $end_time = strtotime("22:00");
-    $service_duration = $service->duration * 60;
-    $service_break = $service->break * 60;
-    
-    while($start_time <= $end_time - $service_duration) {
-        $slot_end = $start_time + $service_duration;
-        $total_occupied = $slot_end + $service_break;
-        $available = true;
-        
-        // Проверяем пересечение с учетом перерывов
-        foreach($bookings as $booking) {
-            $busy_start = strtotime($booking->start_time);
-            $busy_end = strtotime($booking->end_time) + ($booking->break * 60);
-            
-            $overlap = ($start_time < $busy_end) && ($total_occupied > $busy_start);
-            
-            if($overlap) {
-                $available = false;
-                break;
-            }
-        }
-        
-        if($available && $slot_end <= $end_time) {
-            $slots[] = [
-                'start' => date('H:i', $start_time),
-                'end' => date('H:i', $slot_end),
-                'price' => $price
-            ];
-        }
-        
-        $start_time += 1800; // Шаг 30 минут
-    }
-    
-    wp_send_json_success([
-        'slots' => $slots,
-        'price' => $price,
-        'is_weekend' => $is_weekend
-    ]);
+if (post_password_required()) {
+    echo get_the_password_form();
+    return;
 }
 
-function submit_booking() {
-    error_log('Received service_id: ' . print_r($_POST['service_id'], true));
-    
-    global $wpdb;
-    $required = ['service_id', 'date', 'start', 'end', 'name', 'phone', 'email'];
-    foreach($required as $field) {
-        if(empty($_POST[$field])) {
-            wp_send_json_error("Не заполнено поле: " . $field);
-        }
+remove_all_actions('wp_head');
+remove_all_actions('wp_footer');
+
+global $wpdb;
+
+// Получаем текущий месяц
+$current_month = isset($_GET['month']) 
+    ? DateTime::createFromFormat('Y-m', sanitize_text_field($_GET['month']))
+    : new DateTime();
+$current_month->modify('first day of this month');
+
+// Получаем записи для текущего месяца
+$start_date = $current_month->format('Y-m-01');
+$end_date = $current_month->format('Y-m-t');
+
+$bookings_count = $wpdb->get_results($wpdb->prepare("
+    SELECT 
+        DATE_FORMAT(booking_date, '%%Y-%%m-%%d') as day,
+        COUNT(*) as count
+    FROM {$wpdb->prefix}booking_orders
+    WHERE booking_date BETWEEN %s AND %s
+    GROUP BY day
+", $start_date, $end_date), OBJECT_K);
+
+// Получаем все записи
+$bookings = $wpdb->get_results("
+    SELECT 
+        o.id,
+        DATE(o.booking_date) as booking_date,
+        TIME_FORMAT(o.start_time, '%H:%i') as start_time,
+        TIME_FORMAT(o.end_time, '%H:%i') as end_time,
+        o.client_name,
+        o.client_phone,
+        o.client_email,
+        s.name as service_name 
+    FROM {$wpdb->prefix}booking_orders o
+    LEFT JOIN {$wpdb->prefix}booking_services s 
+    ON o.service_id = s.id
+    WHERE o.booking_date IS NOT NULL
+    AND o.start_time IS NOT NULL
+    AND o.end_time IS NOT NULL
+    ORDER BY o.booking_date ASC, o.start_time ASC
+");
+
+$grouped = [];
+foreach ($bookings as $booking) {
+    if(
+        empty($booking->id) ||
+        empty($booking->booking_date) ||
+        empty($booking->start_time) ||
+        empty($booking->end_time)
+    ) {
+        error_log('Invalid booking data: ' . print_r($booking, true));
+        continue;
     }
-
-    // Получаем данные услуги
-    $service = $wpdb->get_row($wpdb->prepare(
-        "SELECT name, duration, break, weekday_price, weekend_price 
-         FROM {$wpdb->prefix}booking_services 
-         WHERE id = %d", 
-        intval($_POST['service_id'])
-    ));
-    
-    if(!$service) {
-        wp_send_json_error('Услуга не найдена');
-    }
-
-    $data = [
-        'service_id' => intval($_POST['service_id']),
-        'booking_date' => sanitize_text_field($_POST['date']),
-        'start_time' => sanitize_text_field($_POST['start']),
-        'end_time' => sanitize_text_field($_POST['end']),
-        'client_name' => sanitize_text_field($_POST['name']),
-        'client_phone' => preg_replace('/[^0-9]/', '', $_POST['phone']),
-        'client_email' => sanitize_email($_POST['email']),
-        'price' => floatval($_POST['price']),
-        'created_at' => current_time('mysql')
-    ];
-
-    // Проверка на существующие бронирования
-    $exists = $wpdb->get_var($wpdb->prepare(
-        "SELECT o.id 
-        FROM {$wpdb->prefix}booking_orders o 
-        LEFT JOIN {$wpdb->prefix}booking_services s 
-            ON o.service_id = s.id 
-        WHERE o.booking_date = %s 
-        AND (
-            o.start_time < ADDTIME(%s, SEC_TO_TIME(%d)) 
-            AND ADDTIME(o.end_time, SEC_TO_TIME(s.break * 60)) > %s
-        )", 
-        $data['booking_date'], 
-        $data['end_time'], 
-        $service->break * 60, 
-        $data['start_time']
-    ));
-    
-    if($exists) {
-        wp_send_json_error('Это время уже занято');
-    }
-
-    $result = $wpdb->insert("{$wpdb->prefix}booking_orders", $data);
-    if($result === false) {
-        error_log('Ошибка БД: ' . $wpdb->last_error);
-        wp_send_json_error('Ошибка сохранения записи');
-    }
-
-    // Отправка уведомления в Telegram (единственный вызов)
-    $telegram_message = "✅ Новая запись!\n\n"
-        . "📌 Услуга: {$service->name}\n"
-        . "⏱ Длительность: {$service->duration} мин.\n"
-        . "⏳ Перерыв: {$service->break} мин.\n"
-        . "👤 Имя: {$_POST['name']}\n"
-        . "📞 Телефон: " . preg_replace('/[^0-9]/', '', $_POST['phone']) . "\n"
-        . "📧 Email: {$_POST['email']}\n"
-        . "📅 Дата: {$_POST['date']}\n"
-        . "⏰ Время: {$_POST['start']}-{$_POST['end']}\n"
-        . "💵 Стоимость: {$_POST['price']} руб.";
-
-    send_telegram_message(ADMIN_CHAT_ID, $telegram_message);
-    
-    manage_telegram_calendar('930819186'); // Обновляем календарь
-    wp_send_json_success(['booking_id' => $wpdb->insert_id]);
+    $date = $booking->booking_date;
+    $grouped[$date][] = $booking;
 }
 
-// =============================================
-// ФОРМА БРОНИРОВАНИЯ (frontend)
-// =============================================
-
-
-add_shortcode('booking_form', function() {
-    global $wpdb;
-    $services = $wpdb->get_results("SELECT * FROM {$wpdb->prefix}booking_services");
-    ob_start(); ?>
-    
+?><!DOCTYPE html>
+<html <?php language_attributes(); ?>>
+<head>
+    <meta charset="<?php bloginfo('charset'); ?>">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Админ-панель бронирований</title>
+    <?php wp_head(); ?>
     <style>
-    .booking-form {
-        max-width: 800px;
+    .booking-admin-container {
+        max-width: 1200px;
         margin: 2rem auto;
-        padding: 2rem;
-        background: #fff;
-        border-radius: 8px;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        padding: 0 20px;
     }
-    .form-group {
+
+    .calendar-wrapper {
+        margin: 2rem 0;
+        background: white;
+        padding: 1.5rem;
+        border-radius: 12px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+    }
+
+    .calendar-nav {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
         margin-bottom: 1.5rem;
     }
-    .form-group label {
-        display: block;
-        margin-bottom: 0.5rem;
-        font-weight: 500;
-        color: #333;
-    }
-    input, select {
-        width: 100%;
-        padding: 0.8rem;
-        border: 1px solid #ddd;
-        border-radius: 4px;
-        font-size: 1rem;
-    }
-    #time-slots {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
-        gap: 0.5rem;
-        margin: 1.5rem 0;
-    }
-    .time-slot {
-        padding: 0.8rem;
-        border: 1px solid #ddd;
-        border-radius: 4px;
-        text-align: center;
-        cursor: pointer;
-        transition: all 0.2s;
-    }
-    .time-slot.selected {
-        background: #2196F3;
-        color: white;
-        border-color: #2196F3;
-    }
-    #submit-booking {
-        width: 100%;
-        padding: 1rem;
-        background: #4CAF50;
+
+    .calendar-nav button {
+        background: #3498db;
         color: white;
         border: none;
-        border-radius: 4px;
-        font-size: 1.1rem;
+        padding: 0.8rem 1.5rem;
+        border-radius: 6px;
         cursor: pointer;
-        margin-top: 1rem;
+        transition: background 0.3s;
     }
-    .service-info {
-        margin: 10px 0;
-        padding: 10px;
-        background: #f5f5f5;
-        border-radius: 4px;
+
+    .calendar-nav button:hover {
+        background: #2980b9;
+    }
+
+    .calendar-table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+
+    .calendar-table th,
+    .calendar-table td {
+        padding: 1rem;
+        text-align: center;
+        border: 1px solid #eee;
+        height: 60px;
+    }
+
+    .calendar-table th {
+        background: #f8f9fa;
+        font-weight: 500;
+    }
+
+    .calendar-day {
+        cursor: pointer;
+        transition: background 0.2s;
+        position: relative;
+    }
+
+    .calendar-day:hover {
+        background: #f8f9fa;
+    }
+
+    .calendar-day.active {
+        background: #3498db;
+        color: white;
+    }
+
+    .event-count {
+        font-size: 0.8em;
+        color: #666;
+        position: absolute;
+        bottom: 2px;
+        right: 2px;
+    }
+
+    .calendar-day.active .event-count {
+        color: white;
+    }
+
+    .other-month {
+        background: #fafafa;
+        color: #999;
+    }
+
+    .today {
+        background: #e3f2fd;
+    }
+
+    #noBookingsMessage {
+        display: none;
+        padding: 1.5rem;
+        background: #f8f9fa;
+        border-radius: 8px;
+        color: #666;
+        text-align: center;
+        margin: 2rem 0;
+    }
+
+    .bookings-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2rem;
+    }
+
+    .booking-day-card {
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        padding: 1.5rem;
+    }
+
+    .booking-date-header {
+        font-size: 1.5rem;
+        color: #2c3e50;
+        margin-bottom: 1.5rem;
+        padding-bottom: 1rem;
+        border-bottom: 2px solid #3498db;
+    }
+
+    .booking-item {
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+        background: #f8f9fa;
+        border-radius: 8px;
+        transition: transform 0.2s;
+        border: 1px solid #eee;
+    }
+
+    .booking-item:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 3px 8px rgba(0, 0, 0, 0.08);
+    }
+
+    .client-info div {
+        margin: 0.8rem 0;
+        font-size: 1rem;
+    }
+
+    .info-label {
+        color: #3498db;
+        font-weight: 500;
+        min-width: 80px;
+        display: inline-block;
+    }
+
+    .actions {
+        margin-top: 1.5rem;
+        display: flex;
+        gap: 1rem;
+        flex-wrap: wrap;
+    }
+
+    .btn {
+        padding: 0.8rem 1.5rem;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.95rem;
+        transition: all 0.3s;
+        min-width: 120px;
+        text-align: center;
+    }
+
+    .btn-edit {
+        background: #3498db;
+        color: white;
+    }
+
+    .btn-edit:hover {
+        background: #2980b9;
+    }
+
+    .btn-delete {
+        background: #e74c3c;
+        color: white;
+    }
+
+    .btn-delete:hover {
+        background: #c0392b;
+    }
+
+    #editModal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0,0,0,0.5);
+        z-index: 1000;
+        backdrop-filter: blur(3px);
+    }
+
+    .modal-content {
+        background: white;
+        max-width: 500px;
+        margin: 3rem auto;
+        padding: 2rem;
+        border-radius: 12px;
+        position: relative;
+    }
+
+    @media (max-width: 768px) {
+        .calendar-table td, .calendar-table th {
+            padding: 0.5rem;
+            font-size: 0.9rem;
+        }
+        
+        .calendar-nav button {
+            padding: 0.6rem 1rem;
+        }
+        
+        .booking-admin-container {
+            padding: 0 15px;
+        }
     }
     </style>
+</head>
+<body style="margin:0; background:#f0f0f1;">
 
-    <div class="booking-form">
-        <div class="form-group">
-            <label for="booking-date">Дата:</label>
-            <input type="date" id="booking-date" min="<?= date('Y-m-d') ?>" required>
+<div class="booking-admin-container">
+    <h1>Управление записями</h1>
+    
+    <div class="calendar-wrapper">
+        <div class="calendar-nav">
+            <button onclick="changeMonth(-1)">&larr; Предыдущий</button>
+            <h3><?= $current_month->format('F Y') ?></h3>
+            <button onclick="changeMonth(1)">Следующий &rarr;</button>
         </div>
         
-        <div class="form-group">
-            <label for="booking-service">Услуга:</label>
-            <select id="booking-service" required>
-                <?php foreach($services as $service): ?>
-                <option value="<?= $service->id ?>" 
-                    data-duration="<?= $service->duration ?>"
-                    data-break="<?= $service->break ?>"
-                    data-weekday-price="<?= $service->weekday_price ?>" 
-                    data-weekend-price="<?= $service->weekend_price ?>">
-                    <?= $service->name ?> 
-                    (Длительность: <?= $service->duration ?> мин,
-                     Перерыв: <?= $service->break ?> мин)
-                </option>
-                <?php endforeach; ?>
-            </select>
-        </div>
+        <table class="calendar-table">
+            <tr>
+                <th>Пн</th><th>Вт</th><th>Ср</th><th>Чт</th><th>Пт</th><th>Сб</th><th>Вс</th>
+            </tr>
+            <?php
+            $day = 1;
+            $first_day = (int)$current_month->format('N');
+            $total_days = (int)$current_month->format('t');
+            $currentDate = new DateTime();
+            
+            for ($i = 0; $i < 6; $i++) {
+                echo '<tr>';
+                for ($j = 1; $j <= 7; $j++) {
+                    $cell_class = [];
+                    $date_str = null;
+                    
+                    if (($i === 0 && $j < $first_day) || $day > $total_days) {
+                        $diff = $day > $total_days ? $day - $total_days : -($first_day - $j);
+                        $temp_date = clone $current_month;
+                        $temp_date->modify($diff . ' days');
+                        $date_str = $temp_date->format('Y-m-d');
+                        $cell_class[] = 'other-month';
+                    } else {
+                        $date_str = $current_month->format('Y-m-') . str_pad($day, 2, '0', STR_PAD_LEFT);
+                        if ($date_str === $currentDate->format('Y-m-d')) {
+                            $cell_class[] = 'today';
+                        }
+                        $day++;
+                    }
 
-        <div class="form-group">
-            <label>Доступное время:</label>
-            <div id="time-slots"></div>
-        </div>
-
-        <div class="form-group">
-            <input type="text" id="client-name" placeholder="Ваше имя" required>
-        </div>
-        
-        <div class="form-group">
-            <input type="tel" id="client-phone" placeholder="Телефон" required>
-        </div>
-        
-        <div class="form-group">
-            <input type="email" id="client-email" required placeholder="Email">
-        </div>
-
-        <button id="submit-booking">Забронировать</button>
+                    $count = $bookings_count[$date_str]->count ?? 0;
+                    $display_day = $date_str ? explode('-', $date_str)[2] : '';
+                    
+                    echo '<td class="calendar-day ' . implode(' ', $cell_class) . '" 
+                         data-date="' . $date_str . '"
+                         onclick="selectDate(this)">';
+                    
+                    echo '<div>' . $display_day . '</div>';
+                    if ($count > 0) {
+                        echo '<span class="event-count">(' . $count . ')</span>';
+                    }
+                    
+                    echo '</td>';
+                }
+                echo '</tr>';
+                if ($day > $total_days) break;
+            }
+            ?>
+        </table>
     </div>
 
-    <script>
-    document.addEventListener('DOMContentLoaded', () => {
-        const dateInput = document.getElementById('booking-date');
-        const serviceSelect = document.getElementById('booking-service');
-        const timeSlots = document.getElementById('time-slots');
-        
-        function updatePriceDisplay() {
-            const date = new Date(dateInput.value);
-            const isWeekend = [0, 6].includes(date.getDay());
-            const price = isWeekend 
-                ? serviceSelect.options[serviceSelect.selectedIndex].dataset.weekendPrice 
-                : serviceSelect.options[serviceSelect.selectedIndex].dataset.weekdayPrice;
-        }
+    <div id="noBookingsMessage">Нет записей на выбранную дату</div>
 
-        function loadSlots() {
-             const service = {
-                duration: parseInt(document.querySelector('#booking-service').dataset.duration),
-                break: parseInt(document.querySelector('#booking-service').dataset.break)
-            };
-            if(!dateInput.value) return;
-            
-            fetch('/wp-admin/admin-ajax.php', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: new URLSearchParams({
-                    action: 'get_time_slots',
-                    service_id: serviceSelect.value,
-                    date: dateInput.value
-                })
-            })
-            .then(r => r.json())
-            .then(data => {
-                if(data.success) {
-                    timeSlots.innerHTML = data.data.slots.map(slot => `
-                        <div class="time-slot" 
-                             data-start="${slot.start}" 
-                             data-end="${slot.end}"
-                             data-price="${slot.price}">
-                            ${slot.start}
+    <div class="bookings-list">
+        <?php if (empty($grouped)): ?>
+            <div class="no-bookings">Нет активных записей</div>
+        <?php else: ?>
+            <?php foreach ($grouped as $date => $items): ?>
+                <div class="booking-day-card" data-date="<?= esc_attr($date) ?>">
+                    <div class="booking-date-header"><?= date('d.m.Y', strtotime($date)) ?></div>
+                    <?php foreach ($items as $booking): ?>
+                        <div class="booking-item">
+                            <div class="client-info">
+                                <div><span class="info-label">Время:</span><?= esc_html($booking->start_time) ?> - <?= esc_html($booking->end_time) ?></div>
+                                <div><span class="info-label">Имя:</span><?= esc_html($booking->client_name) ?></div>
+                                <div><span class="info-label">Телефон:</span><?= esc_html($booking->client_phone) ?></div>
+                                <div><span class="info-label">Услуга:</span><?= esc_html($booking->service_name) ?></div>
+                            </div>
+                            <div class="actions">
+                                <button class="btn btn-edit" 
+                                    data-id="<?= $booking->id ?>"
+                                    data-date="<?= esc_attr($booking->booking_date) ?>"
+                                    data-start="<?= esc_attr(substr($booking->start_time, 0, 5)) ?>"
+                                    data-end="<?= esc_attr(substr($booking->end_time, 0, 5)) ?>"
+                                    data-name="<?= esc_attr($booking->client_name) ?>"
+                                    data-phone="<?= esc_attr($booking->client_phone) ?>"
+                                    data-email="<?= esc_attr($booking->client_email) ?>">
+                                    Изменить
+                                </button>
+                                </button>
+                                <button class="btn btn-delete" data-id="<?= $booking->id ?>">Удалить</button>
+                            </div>
                         </div>
-                    `).join('');
-                }
-            });
-        }
+                    <?php endforeach; ?>
+                </div>
+            <?php endforeach; ?>
+        <?php endif; ?>
+    </div>
+</div>
 
-        dateInput.addEventListener('change', () => {
-            updatePriceDisplay();
-            loadSlots();
+<div id="editModal">
+    <div class="modal-content">
+        <h3>Редактирование записи</h3>
+        <form id="editForm">
+            <input type="hidden" name="nonce" value="<?= wp_create_nonce('edit_booking_nonce') ?>">
+            <input type="hidden" name="booking_id" id="editBookingId">
+            <div class="form-group">
+                <label>Дата:</label>
+                <input type="date" name="date" id="editDate" required>
+            </div>
+            <div class="form-group">
+                <label>Время начала:</label>
+                <input type="time" name="start_time" id="editStart" required>
+            </div>
+            <div class="form-group">
+                <label>Время окончания:</label>
+                <input type="time" name="end_time" id="editEnd" required>
+            </div>
+            <div class="form-group">
+                <label>Имя клиента:</label>
+                <input type="text" name="name" id="editName" required>
+            </div>
+            <div class="form-group">
+                <label>Телефон:</label>
+                <input type="tel" name="phone" id="editPhone" required>
+            </div>
+            <div class="form-group">
+                <label>Email:</label>
+                <input type="email" name="email" id="editEmail" required>
+            </div>
+            <button type="submit" class="btn btn-edit">Сохранить</button>
+        </form>
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    let isProcessing = false;
+    let selectedDate = null;
+    
+    // Обработчик кликов по календарю
+    document.querySelector('.calendar-table').addEventListener('click', (e) => {
+        const cell = e.target.closest('.calendar-day');
+        if(cell) selectDate(cell);
+    });
+
+    // Навигация по месяцам
+        window.changeMonth = function(offset) {
+        const url = new URL(window.location.href);
+        const currentMonth = url.searchParams.get('month') || '<?= $current_month->format('Y-m') ?>';
+        const newDate = new Date(currentMonth + '-01');
+        newDate.setMonth(newDate.getMonth() + offset);
+        url.searchParams.set('month', newDate.toISOString().slice(0,7));
+        window.location.href = url.href;
+    };
+    
+    window.selectDate = function(cell) {
+        const date = cell.dataset.date;
+        if(!date) return;
+    
+        document.querySelectorAll('.calendar-day').forEach(c => {
+            c.classList.remove('active');
         });
-
-        serviceSelect.addEventListener('change', () => {
-            if(dateInput.value) {
-                updatePriceDisplay();
-                loadSlots();
-            }
+        
+        cell.classList.add('active');
+        selectedDate = date;
+        
+        document.querySelectorAll('.booking-day-card').forEach(card => {
+            card.style.display = card.dataset.date === date ? 'block' : 'none';
         });
+        
+        document.getElementById('noBookingsMessage').style.display = 
+            document.querySelector('.booking-day-card[data-date="' + date + '"]') ? 'none' : 'block';
+    };
 
-        timeSlots.addEventListener('click', (e) => {
-            if(e.target.classList.contains('time-slot')) {
-                document.querySelectorAll('.time-slot').forEach(s => s.classList.remove('selected'));
-                e.target.classList.add('selected');
-            }
-        });
+    // Обработка удаления
+    async function handleDelete(button) {
+        if(isProcessing) return;
+        isProcessing = true;
 
-        document.getElementById('submit-booking').addEventListener('click', () => {
-            const selected = document.querySelector('.time-slot.selected');
-            if(!selected) return alert('Выберите время!');
+        try {
+            const item = button.closest('.booking-item');
+            item.style.opacity = '0.5';
             
+            const response = await fetch('/wp-admin/admin-ajax.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    action: 'delete_booking',
+                    booking_id: button.dataset.id
+                })
+            });
+
+            const data = await response.json();
+
+            if(!response.ok || !data.success) {
+                throw new Error(data.data || 'Ошибка сервера');
+            }
+
+            item.style.transition = 'all 0.4s';
+            item.style.transform = 'translateX(-100%)';
+            item.style.opacity = '0';
+            
+            setTimeout(() => {
+                item.remove();
+                isProcessing = false;
+            }, 400);
+
+        } catch (error) {
+            alert(error.message);
+            button.disabled = false;
+            item.style.opacity = '1';
+            isProcessing = false;
+        }
+    }
+
+    // Обработчики удаления
+    ['click', 'touchend'].forEach(event => {
+        document.body.addEventListener(event, (e) => {
+            const btn = e.target.closest('.btn-delete');
+            if(!btn || isProcessing) return;
+            
+            e.preventDefault();
+            if(confirm('Удалить запись?')) {
+                btn.disabled = true;
+                handleDelete(btn);
+            }
+        }, { passive: false });
+    });
+
+    // Редактирование записей
+    document.getElementById('editForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const form = e.target;
+        const submitBtn = form.querySelector('button[type="submit"]');
+        
+        try {
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Сохранение...';
+
             const formData = {
-                action: 'submit_booking',
-                service_id: serviceSelect.value,
-                date: dateInput.value,
-                start: selected.dataset.start,
-                end: selected.dataset.end,
-                name: document.getElementById('client-name').value.trim(),
-                phone: document.getElementById('client-phone').value.replace(/\D/g, ''),
-                email: document.getElementById('client-email').value.trim(),
-                price: selected.dataset.price
+                booking_id: form.booking_id.value,
+                date: form.date.value,
+                start_time: form.start_time.value,
+                end_time: form.end_time.value,
+                name: form.name.value,
+                phone: form.phone.value,
+                email: form.email.value,
+                nonce: form.nonce.value
             };
 
-            fetch('/wp-admin/admin-ajax.php', {
+            const response = await fetch('/wp-admin/admin-ajax.php', {
                 method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 body: new URLSearchParams(formData)
-            })
-            .then(r => r.json())
-            .then(data => {
-                if(data.success) {
-                    alert('Бронирование успешно! ID: ' + data.data.booking_id);
-                    location.reload();
-                } else {
-                    alert('Ошибка: ' + data.data);
-                }
             });
-        });
 
-        // Маска для телефона
-        document.getElementById('client-phone').addEventListener('input', function(e) {
-            let x = e.target.value.replace(/\D/g, '').match(/(\d{0,1})(\d{0,3})(\d{0,3})(\d{0,2})(\d{0,2})/);
-            e.target.value = !x[2] ? x[1] : '+7 (' + x[2] + ') ' + x[3] + (x[4] ? '-' + x[4] : '') + (x[5] ? '-' + x[5] : '');
-        });
-    });
-    </script>
-    
-    <?php
-    return ob_get_clean();
-});
+            const data = await response.json();
 
-
-
-
-// =============================================
-// АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ
-// =============================================
-
-add_action('admin_menu', function() {
-    add_menu_page(
-        'Управление записями',
-        'Записи',
-        'manage_options',
-        'manage_bookings',
-        'manage_bookings_page'
-    );
-});
-
-
-// Функция для отображения страницы управления записями
-function manage_bookings_page() {
-    global $wpdb;
-
-    // Получаем все записи, сортируя их по дате и времени по убыванию
-    $bookings = $wpdb->get_results("
-        SELECT * FROM {$wpdb->prefix}booking_orders
-        ORDER BY booking_date DESC, start_time DESC
-    ");
-
-    // Выводим заголовок
-    echo '<div class="wrap">';
-    echo '<h1>Управление записями</h1>';
-    
-    // Форма для добавления новой записи
-    echo '<h2>Добавить новую запись</h2>';
-    echo '<form id="add-booking-form">
-            <input type="date" name="booking_date" required placeholder="Дата">
-            <input type="time" name="start_time" required placeholder="Время начала">
-            <input type="time" name="end_time" required placeholder="Время окончания">
-            <input type="text" name="client_name" required placeholder="Имя клиента">
-            <input type="tel" name="client_phone" required placeholder="Телефон">
-            <input type="email" name="client_email" required placeholder="Email">
-            <button type="submit">Добавить запись</button>
-          </form>';
-
-    // Выводим таблицу с записями
-    echo '<table class="wp-list-table widefat fixed striped">';
-    echo '<thead>
-            <tr>
-                <th>ID</th>
-                <th>Дата</th>
-                <th>Время</th>
-                <th>Услуга</th>
-                <th>Имя клиента</th>
-                <th>Телефон</th>
-                <th>Email</th>
-                <th>Действия</th>
-            </tr>
-          </thead>';
-    echo '<tbody>';
-    foreach ($bookings as $booking) {
-        echo '<tr>
-                <td>' . esc_html($booking->id) . '</td>
-                <td>' . esc_html($booking->booking_date) . '</td>
-                <td>' . esc_html($booking->start_time) . ' - ' . esc_html($booking->end_time) . '</td>
-                <td>' . esc_html($booking->service_id) . '</td>
-                <td>' . esc_html($booking->client_name) . '</td>
-                <td>' . esc_html($booking->client_phone) . '</td>
-                <td>' . esc_html($booking->client_email) . '</td>
-                <td>
-                    <a href="#" class="edit-booking" data-id="' . esc_attr($booking->id) . '">Редактировать</a>
-                    <a href="#" class="delete-booking" data-id="' . esc_attr($booking->id) . '">Удалить</a>
-                </td>
-              </tr>';
-    }
-    echo '</tbody>';
-    echo '</table>';
-
-    // Модальное окно для редактирования записи
-    echo '<div id="edit-booking-modal" style="display:none;">
-            <h2>Редактировать запись</h2>
-            <form id="edit-booking-form">
-                <input type="hidden" name="booking_id" id="edit-booking-id">
-                <input type="date" name="booking_date" id="edit-booking-date" required placeholder="Дата">
-                <input type="time" name="start_time" id="edit-start-time" required placeholder="Время начала">
-                <input type="time" name="end_time" id="edit-end-time" required placeholder="Время окончания">
-                <input type="text" name="client_name" id="edit-client-name" required placeholder="Имя клиента">
-                <input type="tel" name="client_phone" id="edit-client-phone" required placeholder="Телефон">
-                <input type="email" name="client_email" id="edit-client-email" required placeholder="Email">
-                <button type="submit">Сохранить изменения</button>
-            </form>
-        </div>';
-
-    echo '</div>';
-
-    // Подключаем JavaScript для обработки форм
-    ?>
-    <script>
-    document.getElementById('add-booking-form').addEventListener('submit', function(e) {
-        e.preventDefault();
-        
-        const formData = new FormData(this);
-        formData.append('action', 'add_booking');
-
-        fetch(ajaxurl, {
-            method: 'POST',
-            body: formData
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                alert('Запись добавлена!');
-                location.reload(); // Перезагрузить страницу для обновления данных
-            } else {
-                alert('Ошибка: ' + data.data);
+            if(!response.ok || !data.success) {
+                throw new Error(data.data || 'Ошибка сервера');
             }
-        });
-    });
 
-    document.querySelectorAll('.delete-booking').forEach(button => {
-        button.addEventListener('click', function(e) {
-            e.preventDefault();
-            
-            const bookingId = this.dataset.id;
-            
-            if (confirm('Вы уверены, что хотите удалить эту запись?')) {
-                fetch(ajaxurl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded'
-                    },
-                    body: new URLSearchParams({
-                        action: 'delete_booking',
-                        booking_id: bookingId
-                    })
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        alert('Запись удалена!');
-                        location.reload(); // Перезагрузить страницу
-                    } else {
-                        alert('Ошибка: ' + data.data);
+            // Обновление интерфейса
+            const updatedItem = document.querySelector(`.btn-edit[data-id="${formData.booking_id}"]`);
+            if(updatedItem) {
+                updatedItem.dataset.bookingDate = formData.date;
+                updatedItem.dataset.startTime = formData.start_time;
+                updatedItem.dataset.endTime = formData.end_time;
+                updatedItem.dataset.clientName = formData.name;
+                updatedItem.dataset.clientPhone = formData.phone;
+                updatedItem.dataset.clientEmail = formData.email;
+
+                const itemContainer = updatedItem.closest('.booking-item');
+                itemContainer.querySelectorAll('.info-label').forEach(label => {
+                    const field = label.textContent.replace(':', '').trim();
+                    const valueElement = label.nextElementSibling;
+                    switch(field) {
+                        case 'Время':
+                            valueElement.textContent = `${formData.start_time} - ${formData.end_time}`;
+                            break;
+                        case 'Имя':
+                            valueElement.textContent = formData.name;
+                            break;
+                        case 'Телефон':
+                            valueElement.textContent = formData.phone;
+                            break;
                     }
                 });
             }
-        });
+
+            document.getElementById('editModal').style.display = 'none';
+            alert('Изменения успешно сохранены!');
+
+        } catch (error) {
+            console.error('Ошибка сохранения:', error);
+            alert(error.message);
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Сохранить';
+        }
     });
 
-    document.querySelectorAll('.edit-booking').forEach(button => {
-        button.addEventListener('click', function(e) {
-            e.preventDefault();
-            
-            const bookingId = this.dataset.id;
+    // Открытие модалки редактирования
+    // Исправленный код обработчика клика
+document.body.addEventListener('click', (e) => {
+    const btn = e.target.closest('.btn-edit');
+    if(!btn) return;
 
-            // Получаем данные для редактирования
-            fetch(ajaxurl + '?action=get_booking&booking_id=' + bookingId)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        const booking = data.data;
-                        document.getElementById('edit-booking-id').value = booking.id;
-                        document.getElementById('edit-booking-date').value = booking.booking_date;
-                        document.getElementById('edit-start-time').value = booking.start_time;
-                        document.getElementById('edit-end-time').value = booking.end_time;
-                        document.getElementById('edit-client-name').value = booking.client_name;
-                        document.getElementById('edit-client-phone').value = booking.client_phone;
-                        document.getElementById('edit-client-email').value = booking.client_email;
+    e.preventDefault();
+    
+    // Получаем данные через dataset с правильными именами
+    const bookingData = {
+        id: btn.dataset.id,
+        date: btn.dataset.date,
+        start: btn.dataset.start,
+        end: btn.dataset.end,
+        name: btn.dataset.name,
+        phone: btn.dataset.phone,
+        email: btn.dataset.email
+    };
 
-                        // Показываем модальное окно
-                        document.getElementById('edit-booking-modal').style.display = 'block';
-                    } else {
-                        alert('Ошибка: ' + data.data);
-                    }
-                });
+    console.log('DOM Element:', btn);
+    console.log('Booking Data:', bookingData);
+
+    // Расширенная проверка данных
+    if(
+        !bookingData.id || 
+        !bookingData.date || 
+        !bookingData.start || 
+        !bookingData.end
+    ) {
+        console.error('Invalid data attributes:', {
+            element: btn,
+            html: btn.outerHTML,
+            dataset: btn.dataset
         });
-    });
-
-    // Обработка отправки формы редактирования
-    document.getElementById('edit-booking-form').addEventListener('submit', function(e) {
-        e.preventDefault();
-        
-        const formData = new FormData(this);
-        formData.append('action', 'edit_booking');
-
-        fetch(ajaxurl, {
-            method: 'POST',
-            body: formData
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                alert('Запись обновлена!');
-                location.reload(); // Перезагрузить страницу для обновления данных
-            } else {
-                alert('Ошибка: ' + data.data);
-            }
-        });
-    });
-    </script>
-    <?php
-}
-
-// AJAX обработчики для админ-панели
-add_action('wp_ajax_add_booking', 'add_booking');
-add_action('wp_ajax_delete_booking', 'delete_booking');
-add_action('wp_ajax_get_booking', 'get_booking');
-add_action('wp_ajax_edit_booking', 'edit_booking');
-
-function add_booking() {
-    global $wpdb;
-    
-    // Валидация входных данных
-    $data = [
-        'booking_date' => sanitize_text_field($_POST['booking_date']),
-        'start_time' => sanitize_text_field($_POST['start_time']),
-        'end_time' => sanitize_text_field($_POST['end_time']),
-        'client_name' => sanitize_text_field($_POST['client_name']),
-        'client_phone' => sanitize_text_field($_POST['client_phone']),
-        'client_email' => sanitize_email($_POST['client_email']),
-    ];
-    
-    // Вставка записи в базу данных
-    $result = $wpdb->insert("{$wpdb->prefix}booking_orders", $data);
-    
-    if ($result) {
-        wp_send_json_success();
-    } else {
-        wp_send_json_error('Ошибка добавления записи');
-    }
-}
-
-// AJAX обработчик для удаления записи
-add_action('wp_ajax_delete_booking', 'delete_booking');
-
-function delete_booking() {
-    global $wpdb;
-    
-    $booking_id = intval($_POST['booking_id']);
-    
-    $result = $wpdb->delete("{$wpdb->prefix}booking_orders", ['id' => $booking_id]);
-    
-    if ($result) {
-        wp_send_json_success();
-    } else {
-        wp_send_json_error('Ошибка удаления записи');
-    }
-}
-
-// AJAX обработчик для получения данных записи
-add_action('wp_ajax_get_booking', 'get_booking');
-
-function get_booking() {
-    global $wpdb;
-    
-    $booking_id = intval($_GET['booking_id']);
-    
-    // Получаем данные записи
-    $booking = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}booking_orders WHERE id = %d", $booking_id));
-    
-    if ($booking) {
-        wp_send_json_success($booking);
-    } else {
-        wp_send_json_error('Запись не найдена');
-    }
-}
-
-// AJAX обработчик для редактирования записи
-add_action('wp_ajax_edit_booking', 'edit_booking');
-
-function edit_booking() {
-    global $wpdb;
-
-    $booking_id = intval($_POST['booking_id']);
-    
-    // Валидация и обновление данных
-    $data = [
-        'booking_date' => sanitize_text_field($_POST['booking_date']),
-        'start_time' => sanitize_text_field($_POST['start_time']),
-        'end_time' => sanitize_text_field($_POST['end_time']),
-        'client_name' => sanitize_text_field($_POST['client_name']),
-        'client_phone' => sanitize_text_field($_POST['client_phone']),
-        'client_email' => sanitize_email($_POST['client_email']),
-    ];
-    
-    $result = $wpdb->update("{$wpdb->prefix}booking_orders", $data, ['id' => $booking_id]);
-    
-    if ($result) {
-        // Отправка уведомления в Telegram
-        send_telegram_message('930819186', "Обновление записи:\nИмя: {$data['client_name']}\nТелефон: {$data['client_phone']}\nEmail: {$data['client_email']}\nДата: {$data['booking_date']}\nВремя: {$data['start_time']} - {$data['end_time']}");
-        
-        wp_send_json_success();
-    } else {
-        wp_send_json_error('Ошибка редактирования записи');
-    }
-}
-
-
-
-///////////////////////////////////////////////////////////////
-
-
-
-function send_all_bookings_to_telegram() {
-    global $wpdb;
-
-    // Получаем все записи, сортируя их по дате и времени
-    $bookings = $wpdb->get_results("
-        SELECT * FROM {$wpdb->prefix}booking_orders
-        ORDER BY booking_date ASC, start_time ASC
-    ");
-
-    if (empty($bookings)) {
-        send_telegram_message("Нет созданных записей.");
+        alert('Ошибка: Некорректные данные записи');
         return;
     }
 
-    // Формируем сообщение
-    $message = "Все созданные записи:\n";
-    foreach ($bookings as $booking) {
-        $message .= "ID: {$booking->id}\n";
-        $message .= "Имя: {$booking->client_name}\n";
-        $message .= "Телефон: {$booking->client_phone}\n";
-        $message .= "Email: {$booking->client_email}\n";
-        $message .= "Дата: {$booking->booking_date}\n";
-        $message .= "Время: {$booking->start_time} - {$booking->end_time}\n";
-        $message .= "---------------------------\n";
-    }
-
-    // Отправка сообщения в Telegram
-    send_telegram_message($message);
-}
-
-function send_dates_menu_to_telegram() {
-    global $wpdb;
+    // Заполнение формы
+    document.getElementById('editBookingId').value = bookingData.id;
+    document.getElementById('editDate').value = bookingData.date;
+    document.getElementById('editStart').value = bookingData.start.substring(0, 5); // Форматирование времени
+    document.getElementById('editEnd').value = bookingData.end.substring(0, 5);
+    document.getElementById('editName').value = bookingData.name;
+    document.getElementById('editPhone').value = bookingData.phone;
+    document.getElementById('editEmail').value = bookingData.email;
     
-    $dates = $wpdb->get_col("SELECT DISTINCT booking_date 
-                            FROM {$wpdb->prefix}booking_orders 
-                            ORDER BY booking_date DESC 
-                            LIMIT 10");
-
-    if(empty($dates)) {
-        send_telegram_message('930819186', "Нет доступных записей.");
-        return;
-    }
-
-    $keyboard = [];
-    foreach($dates as $date) {
-        $keyboard[] = [
-            ['text' => "📅 $date", 'callback_data' => "view_records_$date"]
-        ];
-    }
-
-    send_telegram_message_with_keyboard('930819186', "Выберите дату:", $keyboard);
-}
-
-
-
-function send_telegram_message_with_keyboard($chat_id, $message, $keyboard) {
-    $bot_token = '7623757721:AAElzsJ9ajJq_d1ATbI5VFBoiAF0aKyJpcE';
-    $url = "https://api.telegram.org/bot$bot_token/sendMessage";
-    
-    return wp_remote_post($url, [
-        'body' => [
-            'chat_id' => $chat_id,
-            'text' => $message,
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard,
-                'resize_keyboard' => true
-            ])
-        ]
-    ]);
-}
-
-add_action('wp_ajax_handle_telegram_callback', 'handle_telegram_callback');
-function handle_telegram_callback() {
-    global $wpdb;
-
-    // Получаем данные из запроса
-    $callback_data = $_POST['callback_data'];
-
-    // Проверяем, что это запрос на просмотр записей
-    if (strpos($callback_data, 'view_records_') === 0) {
-        $date = str_replace('view_records_', '', $callback_data);
-        
-        // Получаем записи для этой даты
-        $bookings = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}booking_orders WHERE booking_date = %s ORDER BY start_time ASC", $date));
-
-        if (empty($bookings)) {
-            send_telegram_message("Нет записей на эту дату.");
-            return;
-        }
-
-        // Формируем сообщение с записями
-        $message = "Записи на $date:\n";
-        foreach ($bookings as $booking) {
-            $message .= "ID: {$booking->id}\n";
-            $message .= "Имя: {$booking->client_name}\n";
-            $message .= "Телефон: {$booking->client_phone}\n";
-            $message .= "Email: {$booking->client_email}\n";
-            $message .= "Время: {$booking->start_time} - {$booking->end_time}\n";
-            $message .= "---------------------------\n";
-        }
-
-        // Отправляем записи в Telegram
-        send_telegram_message($message);
-    }
-}
-
-// Обработчик вебхука Telegram
-add_action('rest_api_init', function() {
-    register_rest_route('telegram/v1', '/webhook', [
-        'methods' => 'POST',
-        'callback' => 'handle_telegram_update',
-        'permission_callback' => '__return_true'
-    ]);
+    document.getElementById('editModal').style.display = 'block';
 });
 
-// Исправленный обработчик вебхука
-
-
-function handle_telegram_update(WP_REST_Request $request) {
-    global $wpdb;
-    
-    $update = json_decode($request->get_body(), true);
-    error_log('Telegram Update: ' . print_r($update, true)); // Логирование входящего обновления
-
-    // Обработка callback_query (нажатие inline-кнопок)
-    if (isset($update['callback_query'])) {
-        $callback = $update['callback_query'];
-        $chat_id = $callback['message']['chat']['id'];
-        $message_id = $callback['message']['message_id'];
-        $data = $callback['data'];
-        $callback_id = $callback['id'];
-
-        // Всегда отвечаем на callback
-        send_telegram_answer_callback($callback_id);
-
-        // Обработка разных типов callback_data
-        switch (true) {
-            // Навигация по дням
-            case strpos($data, 'prev_day_') === 0:
-                $date = str_replace('prev_day_', '', $data);
-                send_bookings_for_date($chat_id, date('Y-m-d', strtotime($date . ' -1 day')));
-                break;
-                
-            case strpos($data, 'next_day_') === 0:
-                $date = str_replace('next_day_', '', $data);
-                send_bookings_for_date($chat_id, date('Y-m-d', strtotime($date . ' +1 day')));
-                break;
-                
-            // Выбор даты из календаря
-            case strpos($data, 'date_') === 0:
-                $date = str_replace('date_', '', $data);
-                send_bookings_for_date($chat_id, $date);
-                break;
-                
-            // Навигация по месяцам
-            case strpos($data, 'month_') === 0:
-                $month = str_replace('month_', '', $data);
-                manage_telegram_calendar($chat_id, $month);
-                break;
-                
-            // Основные команды
-            case $data === 'show_calendar':
-            case $data === 'Календарь':
-                manage_telegram_calendar($chat_id);
-                break;
-                
-            case $data === 'refresh':
-                manage_telegram_calendar($chat_id);
-                break;
-                
-            case $data === 'select_date':
-                manage_telegram_calendar($chat_id);
-                break;
-                
-            // Отмена/подтверждение бронирования
-            case strpos($data, 'confirm_cancel_') === 0:
-                $booking_id = str_replace('confirm_cancel_', '', $data);
-                cancel_booking($chat_id, $booking_id);
-                break;
-                
-            case $data === 'dont_cancel':
-                send_telegram_message($chat_id, "Отмена записи отменена");
-                break;
-                
-            default:
-                error_log('Unknown callback data: ' . $data);
-                send_telegram_message($chat_id, "Неизвестная команда");
+    // Закрытие модалки
+    document.addEventListener('click', (e) => {
+        if(e.target.id === 'editModal') {
+            document.getElementById('editModal').style.display = 'none';
         }
-    }
-    
-    // Обработка обычных текстовых сообщений
-    if (isset($update['message'])) {
-        $message = $update['message'];
-        $chat_id = $message['chat']['id'];
-        $text = isset($message['text']) ? trim($message['text']) : '';
-        
-        // Обработка команд
-        switch ($text) {
-            case '/add_service':
-                start_service_creation($chat_id);
-                break;
-            case '/list_services':
-                send_services_list($chat_id);
-                break;
-            case '/start':
-            case '/help':
-                $reply = "Доступные команды:\n"
-                       . "/calendar - Показать календарь\n"
-                       . "/bookings - Мои записи\n"
-                       . "/help - Помощь";
-                send_telegram_message($chat_id, $reply);
-                break;
-                
-            case '/calendar':
-            case 'Календарь':
-                manage_telegram_calendar($chat_id);
-                break;
-                
-            case '/bookings':
-                send_user_bookings($chat_id);
-                break;
-                
-            case '/today':
-                send_bookings_for_date($chat_id, date('Y-m-d'));
-                break;
-                
-            case '/tomorrow':
-                send_bookings_for_date($chat_id, date('Y-m-d', strtotime('+1 day')));
-                break;
-            case '/add':
-                start_booking_creation($chat_id);
-                break;
-                
-            case '/delete':
-                handle_delete_command($chat_id);
-                break;
-                
-            case '/edit':
-                handle_edit_command($chat_id);
-                break;
-                
-            default:
-                // Если это не команда, проверяем, может это номер телефона или имя
-                if (preg_match('/^(\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$/', $text)) {
-                    // Обработка номера телефона
-                    process_phone_number($chat_id, $text);
-                } else {
-                    send_telegram_message($chat_id, "Я не понимаю эту команду. Используйте /help для списка команд.");
-                }
-        }
-        // Обработка этапов создания услуги
-         if (isset($_SESSION['creating_service'])) {
-        handle_service_creation($chat_id, $text);
-        }
-        
-         if (isset($update['callback_query'])) {
-        $data = $callback['data'];
-        
-            if (strpos($data, 'edit_') === 0) {
-                $booking_id = str_replace('edit_', '', $data);
-                start_booking_edit($chat_id, $booking_id);
-            }
-            elseif (strpos($data, 'delete_') === 0) {
-                $booking_id = str_replace('delete_', '', $data);
-                handle_delete_booking($chat_id, $booking_id);
-            }
-        }
-    
-    }
-    
-    return new WP_REST_Response(['status' => 'ok'], 200);
-}
+    });
 
-function send_user_bookings($chat_id) {
-    global $wpdb;
-    
-    $bookings = $wpdb->get_results($wpdb->prepare(
-        "SELECT * FROM {$wpdb->prefix}booking_orders 
-         WHERE client_phone = %s 
-         ORDER BY booking_date DESC",
-        get_user_meta($chat_id, 'phone', true)
-    ));
-    
-    if(empty($bookings)) {
-        send_telegram_message($chat_id, "У вас нет активных записей");
-        return;
-    }
-    
-    $message = "Ваши записи:\n\n";
-    foreach($bookings as $booking) {
-        $message .= "📅 " . date('d.m.Y', strtotime($booking->booking_date)) . "\n";
-        $message .= "⏰ " . $booking->start_time . "-" . $booking->end_time . "\n";
-        $message .= "➖➖➖➖➖➖➖➖➖\n";
-    }
-    
-    send_telegram_message($chat_id, $message);
-}
-
-function start_service_creation($chat_id) {
-    // Инициализируем процесс создания услуги
-    update_user_meta($chat_id, 'service_creation_step', 'name');
-    send_telegram_message($chat_id, "Введите название услуги:");
-}
-
-function handle_service_creation($chat_id, $text) {
-    global $wpdb;
-    
-    $current_step = get_user_meta($chat_id, 'service_creation_step', true);
-    
-    switch($current_step) {
-        case 'name':
-            update_user_meta($chat_id, 'new_service_name', $text);
-            update_user_meta($chat_id, 'service_creation_step', 'duration');
-            send_telegram_message($chat_id, "Введите длительность услуги (в минутах):");
-            break;
-            
-        case 'duration':
-            update_user_meta($chat_id, 'new_service_duration', $text);
-            update_user_meta($chat_id, 'service_creation_step', 'break');
-            send_telegram_message($chat_id, "Введите длительность перерыва между сеансами (в минутах):");
-            break;
-            
-        case 'break':
-            update_user_meta($chat_id, 'new_service_break', $text);
-            update_user_meta($chat_id, 'service_creation_step', 'weekday_price');
-            send_telegram_message($chat_id, "Введите стоимость в будни:");
-            break;
-            
-        case 'weekday_price':
-            update_user_meta($chat_id, 'new_service_weekday_price', $text);
-            update_user_meta($chat_id, 'service_creation_step', 'weekend_price');
-            send_telegram_message($chat_id, "Введите стоимость в выходные:");
-            break;
-            
-        case 'weekend_price':
-            $service_data = [
-                'name' => get_user_meta($chat_id, 'new_service_name', true),
-                'duration' => get_user_meta($chat_id, 'new_service_duration', true),
-                'break' => get_user_meta($chat_id, 'new_service_break', true),
-                'weekday_price' => get_user_meta($chat_id, 'new_service_weekday_price', true),
-                'weekend_price' => $text
-            ];
-            
-            // Сохраняем услугу в БД
-            $wpdb->insert("{$wpdb->prefix}booking_services", $service_data);
-            
-            // Очищаем временные данные
-            delete_user_meta($chat_id, 'service_creation_step');
-            delete_user_meta($chat_id, 'new_service_name');
-            delete_user_meta($chat_id, 'new_service_duration');
-            delete_user_meta($chat_id, 'new_service_break');
-            delete_user_meta($chat_id, 'new_service_weekday_price');
-            
-            send_telegram_message($chat_id, "✅ Услуга успешно создана!");
-            break;
-    }
-}
-
-function send_services_list($chat_id) {
-    global $wpdb;
-    
-    $services = $wpdb->get_results("SELECT * FROM {$wpdb->prefix}booking_services");
-    
-    if(empty($services)) {
-        send_telegram_message($chat_id, "Список услуг пуст.");
-        return;
-    }
-    
-    $message = "📋 Список доступных услуг:\n\n";
-    foreach($services as $service) {
-        $message .= "🔹 {$service->name}\n";
-        $message .= "⏱ Длительность: {$service->duration} мин\n";
-        $message .= "⏳ Перерыв: {$service->break} мин\n";
-        $message .= "💵 Стоимость: {$service->weekday_price} руб. (будни)\n";
-        $message .= "💵 Стоимость: {$service->weekend_price} руб. (выходные)\n\n";
-    }
-    
-    send_telegram_message($chat_id, $message);
-}
-
-// Начало процесса создания записи
-function start_booking_creation($chat_id) {
-    update_user_meta($chat_id, 'booking_step', 'select_service');
-    send_services_list_with_keyboard($chat_id);
-}
-
-// Показ списка услуг с inline-кнопками
-function send_services_list_with_keyboard($chat_id) {
-    global $wpdb;
-    
-    $services = $wpdb->get_results("SELECT * FROM {$wpdb->prefix}booking_services");
-    $keyboard = [];
-    
-    foreach ($services as $service) {
-        $keyboard[] = [[
-            'text' => $service->name,
-            'callback_data' => 'select_service_'.$service->id
-        ]];
-    }
-    
-    send_telegram_message($chat_id, "Выберите услугу:", $keyboard);
-}
-
-// Обработка выбора услуги
-function handle_service_selection($chat_id, $service_id) {
-    update_user_meta($chat_id, 'booking_service', $service_id);
-    update_user_meta($chat_id, 'booking_step', 'select_date');
-    manage_telegram_calendar($chat_id);
-}
-
-// Обработка выбора даты
-function handle_date_selection($chat_id, $date) {
-    update_user_meta($chat_id, 'booking_date', $date);
-    update_user_meta($chat_id, 'booking_step', 'select_time');
-    send_time_slots_for_date($chat_id, $date);
-}
-
-// Отправка доступных слотов времени
-function send_time_slots_for_date($chat_id, $date) {
-    global $wpdb;
-    
-    $service_id = get_user_meta($chat_id, 'booking_service', true);
-    $slots = get_available_time_slots($service_id, $date);
-    
-    $keyboard = [];
-    foreach ($slots as $slot) {
-        $keyboard[] = [[
-            'text' => $slot['start'].' - '.$slot['end'],
-            'callback_data' => 'select_time_'.$slot['start'].'_'.$slot['end']
-        ]];
-    }
-    
-    send_telegram_message($chat_id, "Выберите время:", $keyboard);
-}
-
-// Начало процесса редактирования
-function start_booking_edit($chat_id, $booking_id) {
-    global $wpdb;
-    
-    $booking = $wpdb->get_row($wpdb->prepare(
-        "SELECT * FROM {$wpdb->prefix}booking_orders WHERE id = %d",
-        $booking_id
-    ));
-    
-    $keyboard = [
-        [
-            ['text' => '✏️ Дата', 'callback_data' => 'edit_date_'.$booking_id],
-            ['text' => '⏰ Время', 'callback_data' => 'edit_time_'.$booking_id]
-        ],
-        [
-            ['text' => '👤 Имя', 'callback_data' => 'edit_name_'.$booking_id],
-            ['text' => '📞 Телефон', 'callback_data' => 'edit_phone_'.$booking_id]
-        ],
-        [
-            ['text' => '📧 Email', 'callback_data' => 'edit_email_'.$booking_id],
-            ['text' => '❌ Отмена', 'callback_data' => 'cancel_edit']
-        ]
-    ];
-    
-    $message = "Редактирование записи #$booking_id:\n"
-        . "Дата: {$booking->booking_date}\n"
-        . "Время: {$booking->start_time}-{$booking->end_time}\n"
-        . "Имя: {$booking->client_name}\n"
-        . "Телефон: {$booking->client_phone}\n"
-        . "Email: {$booking->client_email}";
-    
-    send_telegram_message($chat_id, $message, $keyboard);
-}
-
-// Обработка изменения даты
-function handle_edit_date($chat_id, $booking_id) {
-    update_user_meta($chat_id, 'editing_booking', $booking_id);
-    update_user_meta($chat_id, 'edit_step', 'date');
-    manage_telegram_calendar($chat_id);
-}
-
-// Обновление записи в БД
-function update_booking_from_telegram($booking_id, $field, $value) {
-    global $wpdb;
-    
-    $data = [$field => sanitize_text_field($value)];
-    $where = ['id' => $booking_id];
-    
-    $wpdb->update("{$wpdb->prefix}booking_orders", $data, $where);
-    
-    // Синхронизация с календарем
-    manage_telegram_calendar(ADMIN_CHAT_ID);
-    send_telegram_message($chat_id, "✅ Запись успешно обновлена!");
-}
-
-// Подтверждение удаления
-function handle_delete_booking($chat_id, $booking_id) {
-    $keyboard = [
-        [
-            ['text' => '✅ Да, удалить', 'callback_data' => 'confirm_delete_'.$booking_id],
-            ['text' => '❌ Отмена', 'callback_data' => 'cancel_delete']
-        ]
-    ];
-    
-    send_telegram_message($chat_id, "Вы уверены, что хотите удалить запись #$booking_id?", $keyboard);
-}
-
-// Фактическое удаление
-function confirm_delete_booking($booking_id) {
-    global $wpdb;
-    
-    $wpdb->delete("{$wpdb->prefix}booking_orders", ['id' => $booking_id]);
-    
-    // Обновление календаря
-    manage_telegram_calendar(ADMIN_CHAT_ID);
-    send_telegram_message($chat_id, "✅ Запись #$booking_id удалена!");
-}
-
-function handle_cancel_booking($chat_id, $booking_id) {
-    // Запрос подтверждения
-    $url = "https://api.telegram.org/bot".TELEGRAM_BOT_TOKEN."/sendMessage";
-    wp_remote_post($url, [
-        'body' => [
-            'chat_id' => $chat_id,
-            'text' => "❓ Подтвердите отмену записи #$booking_id",
-            'reply_markup' => json_encode([
-                'inline_keyboard' => [
-                    [
-                        ['text' => '✅ Да, отменить', 'callback_data' => 'confirm_cancel_'.$booking_id],
-                        ['text' => '❌ Нет, оставить', 'callback_data' => 'dont_cancel']
-                    ]
-                ]
-            ])
-        ]
-    ]);
-}
-
-function format_phone($phone) {
-    $cleaned = preg_replace('/[^0-9]/', '', $phone);
-    return $cleaned ? preg_replace('/(\d{1})(\d{3})(\d{3})(\d{2})(\d{2})/', '+$1 ($2) $3-$4-$5', $cleaned) : 'не указан';
-}
-
-// Исправленная функция отправки сообщения
-function send_telegram_message($chat_id, $text, $buttons = null) {
-    $url = "https://api.telegram.org/bot".TELEGRAM_BOT_TOKEN."/sendMessage";
-    
-    $data = [
-        'chat_id' => $chat_id,
-        'text' => $text,
-        'parse_mode' => 'HTML'
-    ];
-    
-    if($buttons) {
-        $data['reply_markup'] = json_encode(['inline_keyboard' => $buttons]);
-    }
-    
-    $response = wp_remote_post($url, ['body' => $data]);
-    return json_decode(wp_remote_retrieve_body($response), true);
-}
-
-
-// Убедитесь что у вас только ОДИН register_activation_hook
-register_activation_hook(__FILE__, function() {
-    global $wpdb;
-    
-    // Создание таблиц
-    $tables = [
-        "{$wpdb->prefix}telegram_calendar" => "
-            CREATE TABLE {$wpdb->prefix}telegram_calendar (
-                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                chat_id VARCHAR(100) NOT NULL UNIQUE,
-                message_id VARCHAR(100) NOT NULL,
-                last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        "
-    ];
-    
-    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
-    foreach($tables as $sql) {
-        dbDelta($sql);
-    }
-    
-    // Настройка вебхука
-    $webhook_url = get_site_url().'/wp-json/telegram/v1/webhook';
-    wp_remote_post("https://api.telegram.org/bot7623757721:AAElzsJ9ajJq_d1ATbI5VFBoiAF0aKyJpcE/setWebhook", [
-        'body' => ['url' => $webhook_url]
-    ]);
+    // Инициализация текущей даты
+    const todayCell = document.querySelector('.calendar-day.today');
+    if(todayCell) selectDate(todayCell);
 });
+</script>
 
-// 3. Функция отправки подтверждения callback
-function send_telegram_answer_callback($callback_id) {
-    $url = "https://api.telegram.org/bot" . TELEGRAM_BOT_TOKEN . "/answerCallbackQuery";
-    wp_remote_post($url, [
-        'body' => [
-            'callback_query_id' => $callback_id,
-            'show_alert' => false
-        ]
-    ]);
-}
-
-// 4. Обновленная функция отправки записей для даты
-function send_bookings_for_date($chat_id, $date) {
-    global $wpdb;
-    
-    // Получаем записи на указанную дату
-    $bookings = $wpdb->get_results($wpdb->prepare(
-        "SELECT * FROM {$wpdb->prefix}booking_orders 
-         WHERE booking_date = %s 
-         ORDER BY start_time ASC",
-        $date
-    ));
-
-    // Формируем текст сообщения
-    $message = "📅 <b>" . date('d.m.Y', strtotime($date)) . "</b>\n";
-    $message .= "────────────────\n";
-    
-    if(empty($bookings)) {
-        $message .= "На эту дату записей нет";
-    } else {
-        $message .= "Всего записей: " . count($bookings) . "\n";
-        $message .= "────────────────\n\n";
-        
-        foreach($bookings as $booking) {
-            $message .= "🆔 <b>ID:</b> {$booking->id}\n";
-            $message .= "👤 {$booking->client_name}\n";
-            $message .= "⏰ " . date('H:i', strtotime($booking->start_time)) . "-" . date('H:i', strtotime($booking->end_time)) . "\n";
-            $message .= "📞 " . format_phone($booking->client_phone) . "\n";
-            $message .= "────────────────\n";
-        }
-    }
-
-    // Формируем клавиатуру
-    $keyboard = [
-        'inline_keyboard' => [
-            [
-                [
-                    'text' => '⬅️ Пред. день',
-                    'callback_data' => 'prev_day_' . $date
-                ],
-                [
-                    'text' => 'След. день ➡️',
-                    'callback_data' => 'next_day_' . $date
-                ]
-            ],
-            [
-                [
-                    'text' => '📅 Выбрать дату',
-                    'callback_data' => 'select_date'
-                ]
-            ]
-        ]
-    ];
-
-    // Параметры для отправки/редактирования сообщения
-    $params = [
-        'chat_id' => $chat_id,
-        'text' => $message,
-        'parse_mode' => 'HTML',
-        'reply_markup' => json_encode($keyboard)
-    ];
-
-    // Если это редактирование существующего сообщения
-    if(isset($update['callback_query']['message']['message_id'])) {
-        $params['message_id'] = $update['callback_query']['message']['message_id'];
-        $response = wp_remote_post("https://api.telegram.org/bot" . TELEGRAM_BOT_TOKEN . "/editMessageText", [
-            'body' => $params
-        ]);
-    } else {
-        // Или отправка нового сообщения
-        $response = wp_remote_post("https://api.telegram.org/bot" . TELEGRAM_BOT_TOKEN . "/sendMessage", [
-            'body' => $params
-        ]);
-    }
-
-    // Логирование для отладки
-    error_log('Telegram API Response: ' . print_r($response, true));
-    error_log('Keyboard: ' . print_r($keyboard, true));
-}
-
-// Генерация календаря
-function generate_calendar_keyboard($selected_month = null) {
-    global $wpdb;
-    
-    $current_month = $selected_month ?: date('Y-m');
-    $month_start = date('Y-m-01', strtotime($current_month));
-    $month_end = date('Y-m-t', strtotime($current_month));
-    
-    // Получаем занятые даты из БД
-    $booked_dates = $wpdb->get_col($wpdb->prepare(
-        "SELECT DISTINCT booking_date 
-        FROM {$wpdb->prefix}booking_orders 
-        WHERE booking_date BETWEEN %s AND %s",
-        $month_start,
-        $month_end
-    ));
-    
-    // Создаем структуру клавиатуры
-    $keyboard = [];
-    
-    // Кнопки навигации
-    $prev_month = date('Y-m', strtotime('-1 month', strtotime($current_month)));
-    $next_month = date('Y-m', strtotime('+1 month', strtotime($current_month)));
-    
-    $keyboard[] = [
-        ['text' => '⬅️', 'callback_data' => "month_$prev_month"],
-        ['text' => date('F Y', strtotime($current_month)), 'callback_data' => 'current'],
-        ['text' => '➡️', 'callback_data' => "month_$next_month"]
-    ];
-    
-    // Дни недели (полная версия)
-    $keyboard[] = [
-        ['text' => 'Пн', 'callback_data' => ' '],
-        ['text' => 'Вт', 'callback_data' => ' '],
-        ['text' => 'Ср', 'callback_data' => ' '],
-        ['text' => 'Чт', 'callback_data' => ' '],
-        ['text' => 'Пт', 'callback_data' => ' '],
-        ['text' => 'Сб', 'callback_data' => ' '],
-        ['text' => 'Вс', 'callback_data' => ' ']
-    ];
-    
-    // Генерация дней месяца
-    $day = 1;
-    $first_day_of_week = date('N', strtotime($current_month . '-01'));
-    $days_in_month = date('t', strtotime($current_month));
-
-    for ($i = 0; $i < 6; $i++) {
-        $week = [];
-        for ($j = 1; $j <= 7; $j++) {
-            if (($i === 0 && $j < $first_day_of_week) || $day > $days_in_month) {
-                $week[] = ['text' => ' ', 'callback_data' => ' '];
-            } else {
-                $current_date = date('Y-m-') . str_pad($day, 2, '0', STR_PAD_LEFT);
-                $has_booking = in_array($current_date, $booked_dates);
-                
-                $button = [
-                    'text' => $has_booking ? "✅ $day" : $day,
-                    'callback_data' => $has_booking ? "date_$current_date" : ' '
-                ];
-                
-                $week[] = $button;
-                $day++;
-            }
-        }
-        $keyboard[] = $week;
-    }
-    
-     // Добавляем кнопки управления
-    $keyboard[] = [
-        ['text' => '➕ Новая запись', 'callback_data' => 'create_new'],
-        ['text' => '📋 Список записей', 'callback_data' => 'list_bookings']
-    ];
-    
-    return $keyboard;
-}
-
-// Отправка списка записей
-function send_bookings_list($chat_id) {
-    global $wpdb;
-    
-    $bookings = $wpdb->get_results("
-        SELECT * FROM {$wpdb->prefix}booking_orders 
-        ORDER BY booking_date DESC 
-        LIMIT 10
-    ");
-    
-    $keyboard = [];
-    foreach ($bookings as $booking) {
-        $keyboard[] = [[
-            'text' => "#$booking->id {$booking->client_name} - {$booking->booking_date}",
-            'callback_data' => 'show_booking_'.$booking->id
-        ]];
-    }
-    
-    send_telegram_message($chat_id, "Последние 10 записей:", $keyboard);
-}
-
-
-
-
-function edit_telegram_message($chat_id, $message_id, $text, $keyboard) {
-    $bot_token = '7623757721:AAElzsJ9ajJq_d1ATbI5VFBoiAF0aKyJpcE';
-    $url = "https://api.telegram.org/bot$bot_token/editMessageText";
-    
-    return wp_remote_post($url, [
-        'body' => [
-            'chat_id' => $chat_id,
-            'message_id' => $message_id,
-            'text' => $text,
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard,
-                'resize_keyboard' => true
-            ])
-        ]
-    ]);
-}
-
-
-
-function send_updated_calendar() {
-    $chat_id = '930819186';
-    $message_id = 'ID_СООБЩЕНИЯ_С_КАЛЕНДАРЕМ'; // Нужно сохранять при первом отправлении
-    
-    $keyboard = generate_calendar_keyboard();
-    edit_telegram_message($chat_id, $message_id, "Актуальное расписание:", $keyboard);
-}
-
-function setup_telegram_menu() {
-    $chat_id = 'ВАШ_CHAT_ID';
-    $bot_token = 'ВАШ_ТОКЕН';
-    $url = "https://api.telegram.org/bot$bot_token/setChatMenuButton";
-    
-    wp_remote_post($url, [
-        'body' => [
-            'chat_id' => $chat_id,
-            'menu_button' => json_encode([
-                'type' => 'commands'
-            ])
-        ]
-    ]);
-    
-    // Отправляем первоначальное сообщение с календарем
-    $keyboard = generate_calendar_keyboard();
-    send_telegram_message_with_keyboard($chat_id, "Актуальное расписание:", $keyboard);
-}
-
-// =============================================
-// ИНТЕГРАЦИЯ С TELEGRAM (НОВЫЙ ФУНКЦИОНАЛ)
-// =============================================
-
-
-
-
-/**
- * Управление календарем в Telegram
- * 
- * @param string $chat_id ID чата в Telegram
- * @param string|null $month Месяц в формате 'Y-m' (опционально)
- */
-function manage_telegram_calendar($chat_id, $month = null) {
-    global $wpdb;
-    $bot_token = '7623757721:AAElzsJ9ajJq_d1ATbI5VFBoiAF0aKyJpcE'; // Замените на реальный токен
-
-    // 1. Генерация клавиатуры календаря
-    $keyboard = generate_calendar_keyboard($month);
-    $message_text = "📅 Актуальное расписание бронирований:\n\nВыберите дату:";
-
-    // 2. Получаем сохраненный ID сообщения
-    $table_name = $wpdb->prefix . 'telegram_calendar';
-    $saved_message_id = $wpdb->get_var($wpdb->prepare(
-        "SELECT message_id FROM $table_name WHERE chat_id = %s",
-        $chat_id
-    ));
-
-    // 3. Если сообщение существует - редактируем
-    if ($saved_message_id) {
-        $response = edit_telegram_message($chat_id, $saved_message_id, $message_text, $keyboard);
-        
-        if (wp_remote_retrieve_response_code($response) != 200) {
-            $saved_message_id = false;
-        }
-    }
-
-    // 4. Если сообщения нет или оно было удалено
-    if (!$saved_message_id) {
-        $response = send_telegram_message_with_keyboard($chat_id, $message_text, $keyboard);
-        
-        if (!is_wp_error($response)) {
-            $body = json_decode(wp_remote_retrieve_body($response), true);
-            if (isset($body['result']['message_id'])) {
-                // Сохраняем в базу данных
-                $wpdb->replace($table_name, [
-                    'chat_id' => $chat_id,
-                    'message_id' => $body['result']['message_id']
-                ]);
-            }
-        }
-    }
-}
-
-function setup_telegram_bot_menu() {
-    $bot_token = '7623757721:AAElzsJ9ajJq_d1ATbI5VFBoiAF0aKyJpcE';
-    $url = "https://api.telegram.org/bot$bot_token/setChatMenuButton";
-    
-    $response = wp_remote_post($url, [
-        'body' => [
-            'menu_button' => json_encode([
-                'type' => 'commands'
-            ])
-        ]
-    ]);
-    
-    $commands = [
-        ['command' => 'start', 'description' => 'Запуск бота'],
-        ['command' => 'calendar', 'description' => 'Показать календарь'],
-        ['command' => 'add_service', 'description' => 'Добавить новую услугу'],
-        ['command' => 'list_services', 'description' => 'Список услуг'],
-        ['command' => 'help', 'description' => 'Помощь']
-    ];
-    
-    $url = "https://api.telegram.org/bot$bot_token/setMyCommands";
-    wp_remote_post($url, [
-        'body' => ['commands' => json_encode($commands)]
-    ]);
-    
-    // Устанавливаем команды бота
-    $commands_url = "https://api.telegram.org/bot$bot_token/setMyCommands";
-    wp_remote_post($commands_url, [
-        'body' => [
-            'commands' => json_encode([
-                ['command' => 'calendar', 'description' => 'Показать календарь записей'],
-                ['command' => 'help', 'description' => 'Помощь по боту']
-            ])
-        ]
-    ]);
-}
-
-add_action('save_post', 'sync_service_to_telegram', 10, 3);
-function sync_service_to_telegram($post_id, $post, $update) {
-    if($post->post_type != 'service') return; // Предполагаем кастомный тип записи
-    
-    $service_data = get_post_meta($post_id);
-    
-    $message = "🔄 Обновление услуги:\n";
-    $message .= "🔹 Название: {$post->post_title}\n";
-    $message .= "⏱ Длительность: {$service_data['duration']} мин\n";
-    $message .= "⏳ Перерыв: {$service_data['break']} мин\n";
-    $message .= "💵 Стоимость: {$service_data['weekday_price']} руб. (будни)\n";
-    $message .= "💵 Стоимость: {$service_data['weekend_price']} руб. (выходные)";
-    
-    send_telegram_message(ADMIN_CHAT_ID, $message);
-}
-
-
-function send_telegram_reply_keyboard($chat_id, $message) {
-    $bot_token = '7623757721:AAElzsJ9ajJq_d1ATbI5VFBoiAF0aKyJpcE';
-    $url = "https://api.telegram.org/bot$bot_token/sendMessage";
-    
-    $keyboard = [
-        'keyboard' => [
-            [['text' => 'Календарь']],
-            [['text' => 'Помощь']]
-        ],
-        'resize_keyboard' => true,
-        'one_time_keyboard' => false
-    ];
-    
-    return wp_remote_post($url, [
-        'body' => [
-            'chat_id' => $chat_id,
-            'text' => $message,
-            'reply_markup' => json_encode($keyboard)
-        ]
-    ]);
-}
-
-
-
-
-add_action('wp_ajax_handle_telegram_booking', 'handle_telegram_booking');
-add_action('wp_ajax_nopriv_handle_telegram_booking', 'handle_telegram_booking');
-
-function handle_telegram_booking() {
-    $data = $_POST;
-    $action = $data['action_type'];
-    
-    switch ($action) {
-        case 'create':
-            submit_booking_from_telegram($data);
-            break;
-            
-        case 'update':
-            update_booking_from_telegram($data);
-            break;
-            
-        case 'delete':
-            delete_booking_from_telegram($data);
-            break;
-    }
-    
-    wp_send_json_success();
-}
+<?php wp_footer(); ?>
+</body>
+</html>
