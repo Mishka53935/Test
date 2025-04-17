@@ -428,6 +428,10 @@ function delete_booking() {
 }
 
 function update_booking() {
+    
+     if (!wp_verify_nonce($_POST['security'], 'booking_actions')) {
+        wp_send_json_error('Неверный nonce');
+    }
     global $wpdb;
     
     // Проверка nonce
