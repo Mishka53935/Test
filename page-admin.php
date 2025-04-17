@@ -65,7 +65,7 @@ foreach ( $all as $b ) {
 <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
 <script>
 jQuery(function($){
-  const ajaxUrl       = '<?php echo esc_js( admin_url("admin-ajax.php") ); ?>';
+  const ajaxUrl = '<?php echo admin_url("admin-ajax.php"); ?>';
   const bookingNonce  = '<?php echo esc_js( wp_create_nonce("booking_actions") ); ?>';
   const bookingsByDate= <?php echo wp_json_encode($grouped); ?>;
   let selectedDate    = null;
@@ -170,6 +170,7 @@ jQuery(function($){
       client_phone:  editingBooking.client_phone || '',
       client_email:  editingBooking.client_email || ''
     }, function(res){
+        console.log(res);
       if(!res.success){
         return $('#error-msg').text(res.data);
       }
