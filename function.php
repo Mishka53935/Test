@@ -428,14 +428,6 @@ function delete_booking() {
 }
 
 function update_booking() {
-    
-    file_put_contents(__DIR__ . '/debug.log', print_r($_POST, true), FILE_APPEND);
-    wp_send_json_success('Запрос получен');
-
-    
-     if (!wp_verify_nonce($_POST['security'], 'booking_actions')) {
-        wp_send_json_error('Неверный nonce');
-    }
     global $wpdb;
     
     // Проверка nonce
